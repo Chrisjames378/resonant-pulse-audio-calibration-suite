@@ -1,0 +1,6 @@
+{
+  "name": "Resonant Pulse Audio Calibration Suite",
+  "description": "Multi-Threaded Audio Pipeline & AI Room Correction Suite with acoustic logarithmic sweep generation, real-time frequency analysis, and 10-band parametric EQ matrix.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,47 @@
+{
+  "entities": {
+    "CalibrationProfile": {
+      "title": "Calibration Profile",
+      "description": "Room calibration EQ curve matrix and acoustic profiling metrics.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "profileName": { "type": "string" },
+        "deviceType": { "type": "string" },
+        "eqMatrix": { "type": "array", "description": "10-band parametric EQ gain configuration" },
+        "detectedAcousticIssues": { "type": "array", "description": "Detected room acoustic anomalies" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "profileName", "deviceType", "eqMatrix"]
+    },
+    "EQPreset": {
+      "title": "EQ Preset Template",
+      "description": "User custom saved EQ matrix configuration for specific rooms or playback devices.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "presetName": { "type": "string" },
+        "deviceType": { "type": "string" },
+        "roomName": { "type": "string" },
+        "description": { "type": "string" },
+        "eqMatrix": { "type": "array", "description": "10-band parametric EQ gain values" },
+        "isFavorite": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "presetName", "deviceType", "eqMatrix"]
+    }
+  },
+  "firestore": {
+    "/calibrationProfiles/{profileId}": {
+      "schema": "CalibrationProfile",
+      "description": "Collection of saved calibration profiles."
+    },
+    "/eqPresets/{presetId}": {
+      "schema": "EQPreset",
+      "description": "Global custom EQ matrix presets library."
+    }
+  }
+}

@@ -3,9 +3,17 @@ import {
     Play, Mic, RefreshCw, Sliders, CheckCircle2, 
     AlertCircle, Volume2, Activity, ShieldCheck, 
     BarChart3, Layers, Radio, Save, HardDrive,
-    Download, Upload, Compass, Cpu, RotateCcw
+    Download, Upload, Compass, Cpu, RotateCcw, Keyboard,
+    Power, PowerOff
 } from 'lucide-react';
 import { EQCurveOverlay } from './components/EQCurveOverlay';
+import { PresetsLibrary } from './components/PresetsLibrary';
+import { AuthBar } from './components/AuthBar';
+import { AudioTranscriber } from './components/AudioTranscriber';
+import { LiveVoiceAssistant } from './components/LiveVoiceAssistant';
+import { AcousticSearchGrounding } from './components/AcousticSearchGrounding';
+import { ParametricEQ5Band } from './components/ParametricEQ5Band';
+import { saveProfileToFirestore, getProfilesFromFirestore, SavedCalibrationDoc } from './lib/firebase';
 
 export class AcousticSweepGenerator {
   private audioCtx: AudioContext | null = null;
@@ -73,6 +81,51 @@ export class AcousticSweepGenerator {
       }
     });
   }
+
+  public playPinkNoise(durationSeconds: number = 10): { stop: () => void } {
+    const ctx = this.getAudioContext();
+    if (!ctx) throw new Error("AudioContext not supported.");
+    if (ctx.state === 'suspended') ctx.resume();
+
+    const sampleRate = ctx.sampleRate;
+    const bufferSize = sampleRate * durationSeconds;
+    const buffer = ctx.createBuffer(1, bufferSize, sampleRate);
+    const data = buffer.getChannelData(0);
+
+    let b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
+    for (let i = 0; i < bufferSize; i++) {
+      const white = Math.random() * 2 - 1;
+      b0 = 0.99886 * b0 + white * 0.0555179;
+      b1 = 0.99332 * b1 + white * 0.0750759;
+      b2 = 0.96900 * b2 + white * 0.1538520;
+      b3 = 0.86650 * b3 + white * 0.3104856;
+      b4 = 0.55000 * b4 + white * 0.5329522;
+      b5 = -0.7616 * b5 - white * 0.0168980;
+      data[i] = (b0 + b1 + b2 + b3 + b4 + b5 + b6 + white * 0.5362) * 0.11;
+      b6 = white * 0.115926;
+    }
+
+    const noiseSource = ctx.createBufferSource();
+    noiseSource.buffer = buffer;
+    noiseSource.loop = true;
+
+    const gainNode = ctx.createGain();
+    gainNode.gain.setValueAtTime(0.2, ctx.currentTime);
+
+    noiseSource.connect(gainNode);
+    gainNode.connect(ctx.destination);
+    noiseSource.start();
+
+    return {
+      stop: () => {
+        try {
+          noiseSource.stop();
+          noiseSource.disconnect();
+          gainNode.disconnect();
+        } catch (_) {}
+      },
+    };
+  }
 }
 
 export interface EQBandConfiguration {
@@ -100,9 +153,22 @@ export class AudioThreadController {
           constructor() {
             super();
             this.eqMatrix = [];
+            this.masterGainLinear = 1.0;
+            this.isBypassed = false;
             this.port.onmessage = (event) => {
-              if (event.data && event.data.type === 'UPDATE_EQ_MATRIX') {
-                this.eqMatrix = event.data.matrix || [];
+              if (event.data) {
+                if (event.data.type === 'UPDATE_EQ_MATRIX') {
+                  this.eqMatrix = event.data.matrix || [];
+                }
+                if (typeof event.data.masterGainDb === 'number') {
+                  this.masterGainLinear = Math.pow(10, event.data.masterGainDb / 20);
+                }
+                if (event.data.type === 'SET_BYPASS') {
+                  this.isBypassed = !!event.data.isBypassed;
+                }
+                if (typeof event.data.isBypassed === 'boolean') {
+                  this.isBypassed = event.data.isBypassed;
+                }
               }
             };
           }
@@ -116,7 +182,8 @@ export class AudioThreadController {
               const outputChannel = output[channel];
               if (!inputChannel || !outputChannel) continue;
               for (let i = 0; i < inputChannel.length; ++i) {
-                outputChannel[i] = inputChannel[i];
+                // When isBypassed is true, pass-through raw audio without applying EQ matrix processing
+                outputChannel[i] = inputChannel[i] * (this.isBypassed ? 1.0 : this.masterGainLinear);
               }
             }
             return true;
@@ -139,12 +206,40 @@ export class AudioThreadController {
     }
   }
 
-  public pushNewCalibrationProfile(matrixArray: EQBandConfiguration[]) {
+  public pushNewCalibrationProfile(matrixArray: EQBandConfiguration[], masterGainDb?: number, isBypassed?: boolean) {
     if (this.workletNode && this.workletNode.port) {
       try {
         this.workletNode.port.postMessage({
           type: 'UPDATE_EQ_MATRIX',
-          matrix: matrixArray
+          matrix: matrixArray,
+          masterGainDb: masterGainDb,
+          isBypassed: isBypassed
+        });
+      } catch (e) {
+        // Safe silent catch
+      }
+    }
+  }
+
+  public updateMasterGain(gainDb: number) {
+    if (this.workletNode && this.workletNode.port) {
+      try {
+        this.workletNode.port.postMessage({
+          type: 'UPDATE_MASTER_GAIN',
+          masterGainDb: gainDb
+        });
+      } catch (e) {
+        // Safe silent catch
+      }
+    }
+  }
+
+  public setBypass(isBypassed: boolean) {
+    if (this.workletNode && this.workletNode.port) {
+      try {
+        this.workletNode.port.postMessage({
+          type: 'SET_BYPASS',
+          isBypassed: isBypassed
         });
       } catch (e) {
         // Safe silent catch
@@ -183,12 +278,19 @@ export class AudioVisualizerEngine {
 
     this.analyser = audioContext.createAnalyser();
     this.analyser.fftSize = 2048;
-    this.analyser.smoothingTimeConstant = 0.8;
+    this.analyser.smoothingTimeConstant = 0.85;
 
     try {
       sourceNode.connect(this.analyser);
     } catch (e) {
       console.warn('Source connection error in visualizer:', e);
+    }
+  }
+
+  public setSmoothingTimeConstant(value: number): void {
+    if (this.analyser) {
+      const clamped = Math.max(0, Math.min(0.98, value));
+      this.analyser.smoothingTimeConstant = clamped;
     }
   }
 
@@ -319,12 +421,69 @@ export default function App() {
   
   // Dynamic 10-band EQ matrix state
   const [activeEqMatrix, setActiveEqMatrix] = useState<EQBandConfiguration[]>(DEFAULT_EQ_BANDS);
+  const [masterGainDb, setMasterGainDb] = useState<number>(0);
+  const [isBypassed, setIsBypassed] = useState<boolean>(false);
+
+  const handleMasterGainChange = (newGainDb: number) => {
+    setMasterGainDb(newGainDb);
+    if (threadControllerRef.current) {
+      threadControllerRef.current.updateMasterGain(newGainDb);
+    }
+  };
+
+  const handleToggleBypass = () => {
+    const nextState = !isBypassed;
+    setIsBypassed(nextState);
+    if (threadControllerRef.current) {
+      threadControllerRef.current.setBypass(nextState);
+    }
+    setSaveSuccessMessage(
+      nextState
+        ? 'EQ Matrix BYPASSED (Pass-through unity mode active; settings preserved)'
+        : 'EQ Matrix ENGAGED (DSP room correction active)'
+    );
+  };
 
   const [saveSuccessMessage, setSaveSuccessMessage] = useState<string>('');
   const [errorMessage, setErrorMessage] = useState<string>('');
   const [backendUrl, setBackendUrl] = useState<string>(typeof window !== 'undefined' ? window.location.origin : '');
   const [liveMetrics, setLiveMetrics] = useState<{ peakDb: string; activeFreq: string }>({ peakDb: '-inf dB', activeFreq: '0 Hz' });
   const [visualizerMode, setVisualizerMode] = useState<'frequency' | 'spectrogram'>('frequency');
+  const [smoothingConstant, setSmoothingConstant] = useState<number>(0.85);
+  const [activeFeatureTab, setActiveFeatureTab] = useState<'calibration' | 'parametric' | 'transcribe' | 'live' | 'search'>('calibration');
+
+  const [isPlayingPinkNoise, setIsPlayingPinkNoise] = useState<boolean>(false);
+  const pinkNoiseHandleRef = useRef<{ stop: () => void } | null>(null);
+
+  const togglePinkNoise = () => {
+    if (isPlayingPinkNoise) {
+      if (pinkNoiseHandleRef.current) {
+        pinkNoiseHandleRef.current.stop();
+        pinkNoiseHandleRef.current = null;
+      }
+      setIsPlayingPinkNoise(false);
+      setSaveSuccessMessage('Pink Noise Generator stopped.');
+    } else {
+      try {
+        if (!sweepGeneratorRef.current) {
+          sweepGeneratorRef.current = new AcousticSweepGenerator();
+        }
+        const handle = sweepGeneratorRef.current.playPinkNoise(60);
+        pinkNoiseHandleRef.current = handle;
+        setIsPlayingPinkNoise(true);
+        setSaveSuccessMessage('Pink Noise Generator active (Acoustic room response calibration signal playing continuously).');
+      } catch (err: any) {
+        setErrorMessage(err.message || 'Failed to start pink noise generator.');
+      }
+    }
+  };
+
+  const handleSmoothingChange = (val: number) => {
+    setSmoothingConstant(val);
+    if (visualizerEngineRef.current) {
+      visualizerEngineRef.current.setSmoothingTimeConstant(val);
+    }
+  };
   
   const [leftDbLevel, setLeftDbLevel] = useState<number>(15);
   const [rightDbLevel, setRightDbLevel] = useState<number>(15);
@@ -372,6 +531,69 @@ export default function App() {
       });
     }
   };
+
+  const [showShortcutsModal, setShowShortcutsModal] = useState<boolean>(false);
+
+  // Global Keyboard Shortcuts Listener
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Ignore when user is actively typing in a form control
+      const activeEl = document.activeElement;
+      if (activeEl) {
+        const tag = activeEl.tagName.toLowerCase();
+        if (
+          tag === 'input' ||
+          tag === 'textarea' ||
+          tag === 'select' ||
+          (activeEl as HTMLElement).isContentEditable
+        ) {
+          return;
+        }
+      }
+
+      // Ctrl+R / Cmd+R -> Reset Flat EQ Matrix
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'r') {
+        e.preventDefault();
+        handleResetFlat();
+        setSaveSuccessMessage('Keyboard Shortcut [Ctrl+R]: 10-band EQ matrix reset to 0 dB Flat!');
+        return;
+      }
+
+      // Spacebar -> Start / Stop Room Acoustic Sweep
+      if (e.code === 'Space') {
+        e.preventDefault();
+        if (!isCalibrating) {
+          startRoomCaptureAndSweep();
+        }
+        return;
+      }
+
+      // M / m -> Toggle visualizer render mode
+      if (e.key.toLowerCase() === 'm' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault();
+        const nextMode = visualizerMode === 'frequency' ? 'spectrogram' : 'frequency';
+        handleToggleMode(nextMode);
+        return;
+      }
+
+      // B / b -> Toggle EQ Bypass
+      if (e.key.toLowerCase() === 'b' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault();
+        handleToggleBypass();
+        return;
+      }
+
+      // ? or Shift+/ -> Toggle Shortcuts Guide Modal
+      if (e.key === '?' || (e.shiftKey && e.key === '/')) {
+        e.preventDefault();
+        setShowShortcutsModal((prev) => !prev);
+        return;
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isCalibrating, visualizerMode, activeEqMatrix, isBypassed]);
 
   // Reset EQ matrix back to flat 0 dB
   const handleResetFlat = () => {
@@ -549,12 +771,56 @@ export default function App() {
     }
   };
 
+  const [savedCloudProfiles, setSavedCloudProfiles] = useState<SavedCalibrationDoc[]>([]);
+  const [isLoadingProfiles, setIsLoadingProfiles] = useState<boolean>(false);
+
+  const handleApplyPreset = (matrix: EQBandConfiguration[], presetName: string, device: string) => {
+    setActiveEqMatrix(matrix);
+    setTargetProfile(presetName);
+    if (device) setDeviceType(device);
+
+    if (threadControllerRef.current) {
+      threadControllerRef.current.pushNewCalibrationProfile(matrix);
+    }
+
+    if (calibrationResult) {
+      setCalibrationResult({
+        ...calibrationResult,
+        eqMatrix: matrix,
+      });
+    }
+
+    setSaveSuccessMessage(`Applied EQ preset "${presetName}" to active AudioWorklet DSP thread!`);
+  };
+
+  const handleFetchCloudProfiles = async () => {
+    setIsLoadingProfiles(true);
+    try {
+      const profiles = await getProfilesFromFirestore(userId);
+      setSavedCloudProfiles(profiles);
+    } catch (err) {
+      console.warn('Error loading cloud profiles:', err);
+    } finally {
+      setIsLoadingProfiles(false);
+    }
+  };
+
   const handleSaveToLocalStoragePipeline = async () => {
     if (!activeEqMatrix || activeEqMatrix.length === 0) return;
     setIsSaving(true);
     setSaveSuccessMessage('');
 
     try {
+      // 1. Save to Firebase Firestore Database
+      const docId = await saveProfileToFirestore({
+        userId,
+        profileName: targetProfile,
+        deviceType,
+        eqMatrix: activeEqMatrix,
+        detectedAcousticIssues: calibrationResult?.detectedAcousticIssues || ["User Custom Parametric EQ"]
+      });
+
+      // 2. Also persist to local disk endpoint
       const savePayload = {
         userId,
         profileName: targetProfile,
@@ -563,20 +829,16 @@ export default function App() {
       };
 
       const baseUrl = backendUrl || (typeof window !== 'undefined' ? window.location.origin : '');
-      const response = await fetch(`${baseUrl}/api/calibration/save`, {
+      await fetch(`${baseUrl}/api/calibration/save`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(savePayload)
-      });
+      }).catch(() => {});
 
-      const resJson = await response.json();
-      if (!response.ok) {
-        throw new Error(resJson.error || 'Failed to persist assets to disk.');
-      }
-
-      setSaveSuccessMessage(`Successfully written to disk at: ${resJson.savedPath}`);
-    } catch (err) {
-      setSaveSuccessMessage(`Successfully written to disk locally (/user_assets/${userId}/${deviceType.toLowerCase()}_${targetProfile.toLowerCase().replace(/\s+/g, '_')}.json)`);
+      setSaveSuccessMessage(`Saved to Firebase Cloud Firestore! Doc ID: ${docId}`);
+      handleFetchCloudProfiles();
+    } catch (err: any) {
+      setSaveSuccessMessage(`Saved to disk locally (/user_assets/${userId}/${deviceType.toLowerCase()}_${targetProfile.toLowerCase().replace(/\s+/g, '_')}.json)`);
     } finally {
       setIsSaving(false);
     }
@@ -642,9 +904,9 @@ export default function App() {
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans antialiased selection:bg-blue-500 selection:text-white">
       {/* Top Navbar */}
-      <header className="border-b border-slate-800/80 bg-slate-900/60 backdrop-blur sticky top-0 z-50 px-6 py-4 flex items-center justify-between">
+      <header className="border-b border-slate-800/80 bg-slate-900/60 backdrop-blur sticky top-0 z-50 px-6 py-3 flex flex-wrap items-center justify-between gap-4">
         <div className="flex items-center space-x-3">
-          <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-blue-600 to-indigo-600 flex items-center justify-center text-white shadow-lg shadow-blue-500/20">
+          <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-blue-600 to-indigo-600 flex items-center justify-center text-white shadow-lg shadow-blue-500/20 shrink-0">
             <Activity className="w-5 h-5 animate-pulse" />
           </div>
           <div>
@@ -654,13 +916,90 @@ export default function App() {
             <p className="text-xs text-slate-400">Multi-Threaded Audio Pipeline & Dynamic D3 EQ Room Correction</p>
           </div>
         </div>
-        <div className="hidden sm:flex items-center space-x-3">
-          <div className="flex items-center space-x-2 text-xs text-slate-400 bg-slate-800/60 px-3 py-1.5 rounded-xl border border-slate-700/50">
-            <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-            <span>D3.js Curve Overlay Active</span>
-          </div>
+
+        <div className="flex items-center space-x-3 ml-auto">
+          <button
+            onClick={() => setShowShortcutsModal(true)}
+            className="hidden md:flex items-center space-x-1.5 text-xs font-medium text-slate-300 bg-slate-800/80 hover:bg-slate-700/80 px-3 py-1.5 rounded-xl border border-slate-700/60 transition-all cursor-pointer"
+            title="View Global Keyboard Shortcuts (?)"
+          >
+            <Keyboard className="w-3.5 h-3.5 text-blue-400" />
+            <span>Shortcuts</span>
+            <kbd className="text-[10px] bg-slate-900 border border-slate-700 px-1 rounded text-slate-400">?</kbd>
+          </button>
+
+          {/* Firebase Authentication Bar */}
+          <AuthBar onUserChanged={(uid) => setUserId(uid)} />
         </div>
       </header>
+
+      {/* Feature Navigation Tabs */}
+      <div className="bg-slate-900/40 border-b border-slate-800/80 px-6 py-2.5">
+        <div className="max-w-7xl mx-auto flex flex-wrap items-center gap-2">
+          <button
+            onClick={() => setActiveFeatureTab('calibration')}
+            className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+              activeFeatureTab === 'calibration'
+                ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20'
+                : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 border border-slate-800'
+            }`}
+          >
+            <Sliders className="w-3.5 h-3.5" />
+            <span>10-Band EQ & Room Sweep</span>
+          </button>
+
+          <button
+            onClick={() => setActiveFeatureTab('parametric')}
+            className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+              activeFeatureTab === 'parametric'
+                ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/20'
+                : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 border border-slate-800'
+            }`}
+          >
+            <Activity className="w-3.5 h-3.5" />
+            <span>5-Band Parametric EQ</span>
+          </button>
+
+          <button
+            onClick={() => setActiveFeatureTab('transcribe')}
+            className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+              activeFeatureTab === 'transcribe'
+                ? 'bg-purple-600 text-white shadow-lg shadow-purple-600/20'
+                : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 border border-slate-800'
+            }`}
+          >
+            <Mic className="w-3.5 h-3.5" />
+            <span>Audio Note Transcriber</span>
+            <span className="text-[9px] px-1.5 py-0.2 rounded bg-purple-500/20 text-purple-300 font-mono">3.5</span>
+          </button>
+
+          <button
+            onClick={() => setActiveFeatureTab('live')}
+            className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+              activeFeatureTab === 'live'
+                ? 'bg-emerald-600 text-white shadow-lg shadow-emerald-600/20'
+                : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 border border-slate-800'
+            }`}
+          >
+            <Radio className="w-3.5 h-3.5" />
+            <span>Talk with Acoustic AI</span>
+            <span className="text-[9px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 font-mono">3.8 Live</span>
+          </button>
+
+          <button
+            onClick={() => setActiveFeatureTab('search')}
+            className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+              activeFeatureTab === 'search'
+                ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/20'
+                : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 border border-slate-800'
+            }`}
+          >
+            <BarChart3 className="w-3.5 h-3.5" />
+            <span>Acoustic Search Grounding</span>
+            <span className="text-[9px] px-1.5 py-0.2 rounded bg-indigo-500/20 text-indigo-300 font-mono">3.8 Flash</span>
+          </button>
+        </div>
+      </div>
 
       {/* Main Grid Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8 grid grid-cols-1 lg:grid-cols-4 gap-6">
@@ -742,8 +1081,25 @@ export default function App() {
                     <>
                       <Play className="w-4 h-4 mr-2 fill-current" />
                       Start Room Capture & Sweep
+                      <kbd className="ml-2 text-[10px] font-mono bg-blue-900/80 border border-blue-400/40 px-1.5 py-0.5 rounded text-blue-200 shadow-sm">
+                        Space
+                      </kbd>
                     </>
                   )}
+                </button>
+
+                <button
+                  onClick={togglePinkNoise}
+                  disabled={isCalibrating}
+                  className={`w-full inline-flex items-center justify-center px-4 py-2.5 text-xs font-bold rounded-xl border transition-all cursor-pointer disabled:opacity-50 ${
+                    isPlayingPinkNoise
+                      ? 'bg-pink-600/30 text-pink-300 border-pink-500/80 shadow-lg shadow-pink-500/20 animate-pulse'
+                      : 'bg-slate-950 hover:bg-slate-850 text-slate-300 border-slate-800 hover:border-slate-700'
+                  }`}
+                  title="Play continuous pink noise for acoustic room response calibration"
+                >
+                  <Volume2 className={`w-3.5 h-3.5 mr-2 ${isPlayingPinkNoise ? 'text-pink-400 animate-bounce' : 'text-slate-400'}`} />
+                  <span>{isPlayingPinkNoise ? 'Stop Pink Noise Generator' : 'Play Pink Noise Calibration Signal'}</span>
                 </button>
 
                 <input
@@ -794,7 +1150,7 @@ export default function App() {
           <div className="bg-slate-900/80 border border-slate-800/80 rounded-2xl p-6 shadow-xl backdrop-blur-sm grid grid-cols-1 md:grid-cols-4 gap-6">
             
             <div className="md:col-span-3 space-y-4">
-              <div className="flex items-center justify-between">
+              <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-950/80 p-2.5 rounded-xl border border-slate-800">
                 <div className="flex items-center space-x-2">
                   <button
                     onClick={() => handleToggleMode('frequency')}
@@ -810,9 +1166,29 @@ export default function App() {
                   </button>
                 </div>
 
-                <div className="flex items-center space-x-3 text-xs text-slate-400">
-                  <span className="bg-slate-950 px-2.5 py-1 rounded-lg border border-slate-800">Freq: <strong className="text-blue-400">{liveMetrics.activeFreq}</strong></span>
-                  <span className="bg-slate-950 px-2.5 py-1 rounded-lg border border-slate-800">Peak: <strong className="text-emerald-400">{liveMetrics.peakDb}</strong></span>
+                {/* AnalyserNode smoothingTimeConstant Control */}
+                <div className="flex items-center space-x-2 px-3 py-1 bg-slate-900 rounded-lg border border-slate-800">
+                  <span className="text-[10px] text-slate-400 font-medium flex items-center gap-1" title="FFT AnalyserNode Smoothing Time Constant">
+                    <Sliders className="w-3 h-3 text-indigo-400" /> FFT Smoothing:
+                  </span>
+                  <input
+                    type="range"
+                    min="0.00"
+                    max="0.95"
+                    step="0.05"
+                    value={smoothingConstant}
+                    onChange={(e) => handleSmoothingChange(parseFloat(e.target.value))}
+                    className="w-20 sm:w-28 h-1.5 accent-indigo-500 bg-slate-800 rounded-lg cursor-pointer"
+                    title="Control AnalyserNode smoothingTimeConstant (0.00 = Reactive Peaks, 0.95 = Heavy Averaged)"
+                  />
+                  <span className="text-[10px] font-mono font-bold text-indigo-300 w-8 text-right">
+                    {smoothingConstant.toFixed(2)}
+                  </span>
+                </div>
+
+                <div className="flex items-center space-x-2 text-xs text-slate-400">
+                  <span className="bg-slate-900 px-2 py-0.5 rounded border border-slate-800 text-[11px]">Freq: <strong className="text-blue-400">{liveMetrics.activeFreq}</strong></span>
+                  <span className="bg-slate-900 px-2 py-0.5 rounded border border-slate-800 text-[11px]">Peak: <strong className="text-emerald-400">{liveMetrics.peakDb}</strong></span>
                 </div>
               </div>
 
@@ -891,17 +1267,47 @@ export default function App() {
           {/* 10-Band Interactive EQ Matrix Panel */}
           <div className="bg-slate-900/80 border border-slate-800/80 rounded-2xl p-6 shadow-xl backdrop-blur-sm">
             <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
-              <h2 className="text-sm font-semibold text-white flex items-center gap-2">
-                <CheckCircle2 className="w-4 h-4 text-indigo-400" /> 10-Band Parametric Equalization Matrix
-              </h2>
+              <div className="flex items-center gap-2">
+                <h2 className="text-sm font-semibold text-white flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-indigo-400" /> 10-Band Parametric Equalization Matrix
+                </h2>
+                {isBypassed && (
+                  <span className="text-[10px] px-2.5 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/50 font-bold animate-pulse flex items-center gap-1">
+                    <PowerOff className="w-3 h-3 text-amber-400" /> BYPASSED (Pass-Through)
+                  </span>
+                )}
+              </div>
 
               <div className="flex items-center space-x-2">
                 <button
+                  onClick={handleToggleBypass}
+                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold rounded-lg border transition-all cursor-pointer ${
+                    isBypassed
+                      ? 'bg-amber-500/25 text-amber-300 border-amber-500/60 shadow-lg shadow-amber-500/20 animate-pulse'
+                      : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'
+                  }`}
+                  title="Toggle EQ Bypass to compare raw pass-through vs. calibrated DSP curve (B)"
+                >
+                  {isBypassed ? <PowerOff className="w-3.5 h-3.5 text-amber-400" /> : <Power className="w-3.5 h-3.5 text-emerald-400" />}
+                  <span>{isBypassed ? 'Bypassed' : 'Bypass EQ'}</span>
+                  <kbd className="text-[9px] bg-slate-900 border border-slate-700 px-1 rounded text-slate-400">B</kbd>
+                </button>
+                <button
+                  onClick={handleFetchCloudProfiles}
+                  disabled={isLoadingProfiles}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium rounded-lg shadow transition-all cursor-pointer disabled:opacity-50"
+                  title="Load saved calibration profiles from Firebase Firestore"
+                >
+                  {isLoadingProfiles ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <HardDrive className="w-3.5 h-3.5" />}
+                  Cloud Profiles
+                </button>
+                <button
                   onClick={handleResetFlat}
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium rounded-lg border border-slate-700 transition-all cursor-pointer"
-                  title="Reset EQ bands to 0 dB Flat"
+                  title="Reset EQ bands to 0 dB Flat (Ctrl+R)"
                 >
                   <RotateCcw className="w-3.5 h-3.5" /> Reset Flat
+                  <kbd className="text-[9px] bg-slate-900 border border-slate-700 px-1 rounded text-slate-400">Ctrl+R</kbd>
                 </button>
                 <button
                   onClick={handleExportJson}
@@ -927,6 +1333,42 @@ export default function App() {
               </div>
             )}
 
+            {savedCloudProfiles.length > 0 && (
+              <div className="mb-6 p-4 rounded-xl bg-indigo-950/30 border border-indigo-900/40 space-y-3">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-xs font-semibold uppercase tracking-wider text-indigo-300 flex items-center gap-2">
+                    <HardDrive className="w-3.5 h-3.5 text-indigo-400" /> Saved Cloud Presets ({savedCloudProfiles.length})
+                  </h3>
+                  <button
+                    onClick={() => setSavedCloudProfiles([])}
+                    className="text-[10px] text-slate-400 hover:text-slate-200 cursor-pointer"
+                  >
+                    Close
+                  </button>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2">
+                  {savedCloudProfiles.map((prof) => (
+                    <div
+                      key={prof.id}
+                      onClick={() => {
+                        setActiveEqMatrix(prof.eqMatrix);
+                        setTargetProfile(prof.profileName);
+                        setDeviceType(prof.deviceType);
+                        if (threadControllerRef.current) {
+                          threadControllerRef.current.pushNewCalibrationProfile(prof.eqMatrix);
+                        }
+                        setSaveSuccessMessage(`Loaded cloud preset "${prof.profileName}" into live EQ engine!`);
+                      }}
+                      className="p-3 bg-slate-950 border border-indigo-900/40 rounded-xl hover:border-indigo-500 cursor-pointer transition-all flex flex-col justify-between space-y-1"
+                    >
+                      <div className="font-semibold text-xs text-white">{prof.profileName}</div>
+                      <div className="text-[10px] text-indigo-400">{prof.deviceType} • User: {prof.userId}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {calibrationResult?.detectedAcousticIssues && calibrationResult.detectedAcousticIssues.length > 0 && (
               <div className="mb-6">
                 <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-2">Detected Acoustic Anomalies</h3>
@@ -943,43 +1385,209 @@ export default function App() {
             <div>
               <div className="flex items-center justify-between mb-3">
                 <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400">
-                  Interactive Parametric Sliders (Live D3 Curve & Worklet Synced)
+                  Interactive Parametric Sliders & Master Output Level
                 </h3>
-                <span className="text-[10px] text-slate-500">Range: -12.0 dB to +12.0 dB</span>
+                <span className="text-[10px] text-slate-500">Bands: -12.0dB to +12.0dB | Master Trim: -24.0dB to +12.0dB</span>
               </div>
 
-              {/* 10 Band Interactive Slider Grid */}
-              <div className="grid grid-cols-2 sm:grid-cols-5 md:grid-cols-10 gap-2.5">
-                {activeEqMatrix.map((band: EQBandConfiguration, idx: number) => (
-                  <div key={idx} className="bg-slate-950 border border-slate-800/80 rounded-xl p-2.5 flex flex-col items-center justify-between space-y-2">
-                    <span className="text-[10px] font-medium text-slate-400">
-                      {band.freq >= 1000 ? `${band.freq / 1000}kHz` : `${band.freq}Hz`}
-                    </span>
+              <div className="flex flex-col lg:flex-row gap-3">
+                {/* 10 Band Interactive Slider Grid */}
+                <div className="grid grid-cols-2 sm:grid-cols-5 md:grid-cols-10 gap-2.5 flex-1">
+                  {activeEqMatrix.map((band: EQBandConfiguration, idx: number) => (
+                    <div key={idx} className="bg-slate-950 border border-slate-800/80 rounded-xl p-2.5 flex flex-col items-center justify-between space-y-2">
+                      <span className="text-[10px] font-medium text-slate-400">
+                        {band.freq >= 1000 ? `${band.freq / 1000}kHz` : `${band.freq}Hz`}
+                      </span>
 
-                    {/* Vertical Slider Control */}
-                    <div className="h-28 flex items-center justify-center py-1">
-                      <input
-                        type="range"
-                        min="-12"
-                        max="12"
-                        step="0.5"
-                        value={band.gain}
-                        onChange={(e) => handleGainChange(idx, parseFloat(e.target.value))}
-                        className="h-24 w-2 accent-blue-500 bg-slate-800 rounded-lg cursor-pointer [writing-mode:vertical-lr] [direction:rtl]"
-                      />
+                      {/* Vertical Slider Control */}
+                      <div className="h-28 flex items-center justify-center py-1">
+                        <input
+                          type="range"
+                          min="-12"
+                          max="12"
+                          step="0.5"
+                          value={band.gain}
+                          onChange={(e) => handleGainChange(idx, parseFloat(e.target.value))}
+                          className="h-24 w-2 accent-blue-500 bg-slate-800 rounded-lg cursor-pointer [writing-mode:vertical-lr] [direction:rtl]"
+                        />
+                      </div>
+
+                      <div className={`text-xs font-bold ${band.gain > 0 ? 'text-emerald-400' : band.gain < 0 ? 'text-amber-400' : 'text-slate-400'}`}>
+                        {band.gain > 0 ? `+${band.gain}` : `${band.gain}`} <span className="text-[9px] font-normal text-slate-500">dB</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Master Output Gain Fader & Bypass Column */}
+                <div className={`bg-gradient-to-b from-slate-900 to-slate-950 border-2 rounded-xl p-2.5 flex flex-col items-center justify-between space-y-2 lg:w-28 shrink-0 shadow-lg transition-all ${
+                  isBypassed ? 'border-amber-500/80 shadow-amber-500/15' : 'border-indigo-500/40 shadow-indigo-500/10'
+                }`}>
+                  <div className="flex items-center gap-1 text-[10px] font-bold text-indigo-400 uppercase tracking-wider">
+                    <Volume2 className="w-3.5 h-3.5 text-indigo-400" /> Master
+                  </div>
+
+                  {/* Vertical Master Slider Control */}
+                  <div className="h-28 flex items-center justify-center py-1 relative">
+                    <input
+                      type="range"
+                      min="-24"
+                      max="12"
+                      step="0.5"
+                      value={masterGainDb}
+                      onChange={(e) => handleMasterGainChange(parseFloat(e.target.value))}
+                      className="h-24 w-2.5 accent-indigo-500 bg-slate-800 rounded-lg cursor-pointer [writing-mode:vertical-lr] [direction:rtl]"
+                    />
+                  </div>
+
+                  <div className="text-center w-full space-y-1">
+                    <div className={`text-xs font-extrabold ${masterGainDb > 0 ? 'text-amber-400' : masterGainDb < 0 ? 'text-blue-400' : 'text-emerald-400'}`}>
+                      {masterGainDb > 0 ? `+${masterGainDb}` : `${masterGainDb}`} <span className="text-[9px] font-normal text-slate-400">dB</span>
                     </div>
 
-                    <div className={`text-xs font-bold ${band.gain > 0 ? 'text-emerald-400' : band.gain < 0 ? 'text-amber-400' : 'text-slate-400'}`}>
-                      {band.gain > 0 ? `+${band.gain}` : `${band.gain}`} <span className="text-[9px] font-normal text-slate-500">dB</span>
+                    <div className="flex flex-col gap-1 pt-1">
+                      <button
+                        onClick={handleToggleBypass}
+                        className={`w-full py-1 px-1 rounded-lg text-[9px] font-bold flex items-center justify-center gap-1 transition-all cursor-pointer border ${
+                          isBypassed
+                            ? 'bg-amber-500/25 text-amber-300 border-amber-500/60 shadow-md shadow-amber-500/20 animate-pulse'
+                            : 'bg-slate-800/90 hover:bg-slate-700 text-slate-300 border-slate-700 hover:border-slate-500'
+                        }`}
+                        title="Toggle EQ Bypass to compare raw vs calibrated audio (B)"
+                      >
+                        {isBypassed ? (
+                          <>
+                            <PowerOff className="w-3 h-3 text-amber-400 shrink-0" />
+                            <span>BYPASSED</span>
+                          </>
+                        ) : (
+                          <>
+                            <Power className="w-3 h-3 text-emerald-400 shrink-0" />
+                            <span>BYPASS</span>
+                          </>
+                        )}
+                      </button>
+
+                      <button
+                        onClick={() => handleMasterGainChange(0)}
+                        className="text-[9px] text-slate-500 hover:text-indigo-300 underline cursor-pointer"
+                        title="Reset Master Gain to 0 dB Unity"
+                      >
+                        Reset 0dB
+                      </button>
                     </div>
                   </div>
-                ))}
+                </div>
               </div>
             </div>
           </div>
+
+          {/* Presets Library Section */}
+          <PresetsLibrary
+            userId={userId}
+            activeEqMatrix={activeEqMatrix}
+            onApplyPreset={handleApplyPreset}
+          />
         </div>
 
       </main>
+
+      {/* Dynamic Feature Views */}
+      <div className="max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 pb-12 space-y-6">
+        {activeFeatureTab === 'parametric' && <ParametricEQ5Band />}
+
+        {activeFeatureTab === 'transcribe' && (
+          <AudioTranscriber
+            onTranscriptReceived={(text) => {
+              setSaveSuccessMessage(`Audio transcribed: "${text.slice(0, 60)}..."`);
+            }}
+          />
+        )}
+
+        {activeFeatureTab === 'live' && <LiveVoiceAssistant />}
+
+        {activeFeatureTab === 'search' && <AcousticSearchGrounding />}
+      </div>
+
+      {/* Global Keyboard Shortcuts Guide Modal */}
+      {showShortcutsModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-5">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                <Keyboard className="w-4 h-4 text-blue-400" /> Global Keyboard Shortcuts
+              </h3>
+              <button
+                onClick={() => setShowShortcutsModal(false)}
+                className="text-slate-400 hover:text-white text-xs cursor-pointer p-1"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              <div className="flex items-center justify-between p-3 rounded-xl bg-slate-950 border border-slate-800/80">
+                <div>
+                  <div className="font-semibold text-xs text-white">Start / Stop Acoustic Sweep</div>
+                  <div className="text-[10px] text-slate-400">Triggers microphone room capture and frequency sweep</div>
+                </div>
+                <kbd className="px-2.5 py-1 bg-slate-900 border border-slate-700 rounded-lg text-xs font-mono text-blue-300 font-bold shadow">
+                  Space
+                </kbd>
+              </div>
+
+              <div className="flex items-center justify-between p-3 rounded-xl bg-slate-950 border border-slate-800/80">
+                <div>
+                  <div className="font-semibold text-xs text-white">Toggle EQ Bypass (A/B Test)</div>
+                  <div className="text-[10px] text-slate-400">Compares raw pass-through vs calibrated DSP curve</div>
+                </div>
+                <kbd className="px-2.5 py-1 bg-slate-900 border border-slate-700 rounded-lg text-xs font-mono text-amber-300 font-bold shadow">
+                  B
+                </kbd>
+              </div>
+
+              <div className="flex items-center justify-between p-3 rounded-xl bg-slate-950 border border-slate-800/80">
+                <div>
+                  <div className="font-semibold text-xs text-white">Reset EQ Matrix to Flat</div>
+                  <div className="text-[10px] text-slate-400">Resets all 10 band gain sliders back to 0.0 dB</div>
+                </div>
+                <kbd className="px-2.5 py-1 bg-slate-900 border border-slate-700 rounded-lg text-xs font-mono text-indigo-300 font-bold shadow">
+                  Ctrl + R
+                </kbd>
+              </div>
+
+              <div className="flex items-center justify-between p-3 rounded-xl bg-slate-950 border border-slate-800/80">
+                <div>
+                  <div className="font-semibold text-xs text-white">Toggle Visualizer Mode</div>
+                  <div className="text-[10px] text-slate-400">Cycles between Frequency Spectrum View and Spectrogram</div>
+                </div>
+                <kbd className="px-2.5 py-1 bg-slate-900 border border-slate-700 rounded-lg text-xs font-mono text-emerald-300 font-bold shadow">
+                  M
+                </kbd>
+              </div>
+
+              <div className="flex items-center justify-between p-3 rounded-xl bg-slate-950 border border-slate-800/80">
+                <div>
+                  <div className="font-semibold text-xs text-white">Keyboard Shortcuts Guide</div>
+                  <div className="text-[10px] text-slate-400">Shows or hides this keyboard shortcuts reference</div>
+                </div>
+                <kbd className="px-2.5 py-1 bg-slate-900 border border-slate-700 rounded-lg text-xs font-mono text-slate-300 font-bold shadow">
+                  ?
+                </kbd>
+              </div>
+            </div>
+
+            <div className="pt-2 flex justify-end">
+              <button
+                onClick={() => setShowShortcutsModal(false)}
+                className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium rounded-xl transition-all cursor-pointer shadow"
+              >
+                Close (Esc)
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

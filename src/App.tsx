@@ -18,6 +18,14 @@ import { MultiSweepAverager } from './components/MultiSweepAverager';
 import { RoomAcoustics3D } from './components/RoomAcoustics3D';
 import { RT60Analyzer } from './components/RT60Analyzer';
 import { PDFReportGenerator } from './components/PDFReportGenerator';
+import { TargetCurveStudio } from './components/TargetCurveStudio';
+import { PhaseAlignmentCalculator } from './components/PhaseAlignmentCalculator';
+import { WaterfallDecayVisualizer } from './components/WaterfallDecayVisualizer';
+import { MicCalibrationParser } from './components/MicCalibrationParser';
+import { GuidedCalibrationWizard } from './components/GuidedCalibrationWizard';
+import { AcousticTreatmentEngine } from './components/AcousticTreatmentEngine';
+import { ConvolutionIRGenerator } from './components/ConvolutionIRGenerator';
+import { MultiRoomCRM } from './components/MultiRoomCRM';
 import { saveProfileToFirestore, getProfilesFromFirestore, SavedCalibrationDoc } from './lib/firebase';
 
 export class AcousticSweepGenerator {
@@ -490,7 +498,25 @@ export default function App() {
   const [visualizerMode, setVisualizerMode] = useState<'frequency' | 'spectrogram'>('frequency');
   const [smoothingConstant, setSmoothingConstant] = useState<number>(0.85);
   const [activeFeatureTab, setActiveFeatureTab] = useState<
-    'calibration' | 'parametric' | 'multisweep' | 'room3d' | 'rt60' | 'exports' | 'pdfreport' | 'transcribe' | 'live' | 'search'
+    | 'calibration'
+    | 'wizard'
+    | 'targetstudio'
+    | 'phase'
+    | 'waterfall'
+    | 'miccal'
+    | 'treatment'
+    | 'convolver'
+    | 'crm'
+    | 'audition'
+    | 'parametric'
+    | 'multisweep'
+    | 'room3d'
+    | 'rt60'
+    | 'exports'
+    | 'pdfreport'
+    | 'transcribe'
+    | 'live'
+    | 'search'
   >('calibration');
 
   const [isPlayingPinkNoise, setIsPlayingPinkNoise] = useState<boolean>(false);
@@ -1008,15 +1034,117 @@ export default function App() {
           </button>
 
           <button
-            onClick={() => setActiveFeatureTab('parametric')}
+            onClick={() => setActiveFeatureTab('wizard')}
             className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
-              activeFeatureTab === 'parametric'
+              activeFeatureTab === 'wizard'
+                ? 'bg-emerald-600 text-white shadow-lg shadow-emerald-600/20'
+                : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 border border-slate-800'
+            }`}
+          >
+            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+            <span>Guided Wizard</span>
+            <span className="text-[9px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 font-mono">Step-By-Step</span>
+          </button>
+
+          <button
+            onClick={() => setActiveFeatureTab('targetstudio')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+              activeFeatureTab === 'targetstudio'
                 ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/20'
                 : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 border border-slate-800'
             }`}
           >
-            <Activity className="w-3.5 h-3.5" />
-            <span>5-Band Parametric</span>
+            <Sliders className="w-3.5 h-3.5 text-indigo-400" />
+            <span>Target Curves</span>
+            <span className="text-[9px] px-1.5 py-0.2 rounded bg-indigo-500/20 text-indigo-300 font-mono">Harman/Dirac</span>
+          </button>
+
+          <button
+            onClick={() => setActiveFeatureTab('phase')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+              activeFeatureTab === 'phase'
+                ? 'bg-cyan-600 text-white shadow-lg shadow-cyan-600/20'
+                : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 border border-slate-800'
+            }`}
+          >
+            <Compass className="w-3.5 h-3.5 text-cyan-400" />
+            <span>Sub Phase Alignment</span>
+            <span className="text-[9px] px-1.5 py-0.2 rounded bg-cyan-500/20 text-cyan-300 font-mono">Time-of-Flight</span>
+          </button>
+
+          <button
+            onClick={() => setActiveFeatureTab('waterfall')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+              activeFeatureTab === 'waterfall'
+                ? 'bg-purple-600 text-white shadow-lg shadow-purple-600/20'
+                : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 border border-slate-800'
+            }`}
+          >
+            <Layers className="w-3.5 h-3.5 text-purple-400" />
+            <span>3D Waterfall Decay</span>
+            <span className="text-[9px] px-1.5 py-0.2 rounded bg-purple-500/20 text-purple-300 font-mono">Modal Ringing</span>
+          </button>
+
+          <button
+            onClick={() => setActiveFeatureTab('miccal')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+              activeFeatureTab === 'miccal'
+                ? 'bg-amber-600 text-white shadow-lg shadow-amber-600/20'
+                : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 border border-slate-800'
+            }`}
+          >
+            <Mic className="w-3.5 h-3.5 text-amber-400" />
+            <span>Mic .CAL Parser</span>
+          </button>
+
+          <button
+            onClick={() => setActiveFeatureTab('treatment')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+              activeFeatureTab === 'treatment'
+                ? 'bg-rose-600 text-white shadow-lg shadow-rose-600/20'
+                : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 border border-slate-800'
+            }`}
+          >
+            <Activity className="w-3.5 h-3.5 text-rose-400" />
+            <span>Acoustic Panels AI</span>
+            <span className="text-[9px] px-1.5 py-0.2 rounded bg-rose-500/20 text-rose-300 font-mono">Sabines</span>
+          </button>
+
+          <button
+            onClick={() => setActiveFeatureTab('convolver')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+              activeFeatureTab === 'convolver'
+                ? 'bg-emerald-600 text-white shadow-lg shadow-emerald-600/20'
+                : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 border border-slate-800'
+            }`}
+          >
+            <Download className="w-3.5 h-3.5 text-emerald-400" />
+            <span>WAV Convolver IR</span>
+          </button>
+
+          <button
+            onClick={() => setActiveFeatureTab('crm')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+              activeFeatureTab === 'crm'
+                ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20'
+                : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 border border-slate-800'
+            }`}
+          >
+            <HardDrive className="w-3.5 h-3.5 text-blue-400" />
+            <span>Multi-Room CRM</span>
+          </button>
+
+          <button
+            onClick={() => setActiveFeatureTab('audition')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+              activeFeatureTab === 'audition'
+                ? 'bg-rose-600 text-white shadow-lg shadow-rose-600/20'
+                : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 border border-slate-800'
+            }`}
+          >
+            <Radio className="w-3.5 h-3.5 text-rose-400" />
+            <span>Audition A/B</span>
+            <span className="text-[9px] px-1.5 py-0.2 rounded bg-rose-500/20 text-rose-300 font-mono">Realtime</span>
           </button>
 
           <button
@@ -1672,6 +1800,63 @@ export default function App() {
 
       {/* Dynamic Feature Views */}
       <div className="max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 pb-12 space-y-6">
+        {activeFeatureTab === 'wizard' && (
+          <GuidedCalibrationWizard
+            onRunSweep={startRoomCaptureAndSweep}
+            onApplyAutoTrim={handleAutoTrim}
+            onExportProfiles={() => setActiveFeatureTab('exports')}
+          />
+        )}
+
+        {activeFeatureTab === 'targetstudio' && (
+          <TargetCurveStudio
+            activeCurve={[]}
+            onCurveChange={() => {}}
+            onApplyTargetToEQ={(targetCurve) => {
+              const updated = activeEqMatrix.map((band) => {
+                const match = targetCurve.find((c) => Math.abs(c.freq - band.freq) < band.freq * 0.3);
+                return match ? { ...band, gain: Math.round((band.gain + match.gain) * 2) / 2 } : band;
+              });
+              setActiveEqMatrix(updated);
+              if (threadControllerRef.current) {
+                threadControllerRef.current.pushNewCalibrationProfile(updated);
+              }
+              setSaveSuccessMessage('Target curve applied to active 10-band EQ matrix!');
+            }}
+          />
+        )}
+
+        {activeFeatureTab === 'phase' && <PhaseAlignmentCalculator />}
+
+        {activeFeatureTab === 'waterfall' && <WaterfallDecayVisualizer />}
+
+        {activeFeatureTab === 'miccal' && (
+          <MicCalibrationParser
+            onCalibrationLoaded={(filename: string, pts: any[]) => {
+              setSaveSuccessMessage(`Loaded "${filename}" mic profile (${pts.length} calibration points active).`);
+            }}
+          />
+        )}
+
+        {activeFeatureTab === 'treatment' && <AcousticTreatmentEngine />}
+
+        {activeFeatureTab === 'convolver' && (
+          <ConvolutionIRGenerator eqMatrix={activeEqMatrix} masterGainDb={masterGainDb} />
+        )}
+
+        {activeFeatureTab === 'crm' && (
+          <MultiRoomCRM
+            currentEqMatrix={activeEqMatrix}
+            onLoadMatrix={(matrix: EQBandConfiguration[]) => {
+              setActiveEqMatrix(matrix);
+              if (threadControllerRef.current) {
+                threadControllerRef.current.pushNewCalibrationProfile(matrix);
+              }
+              setSaveSuccessMessage('Loaded room profile into live EQ engine!');
+            }}
+          />
+        )}
+
         {activeFeatureTab === 'parametric' && <ParametricEQ5Band />}
 
         {activeFeatureTab === 'exports' && (

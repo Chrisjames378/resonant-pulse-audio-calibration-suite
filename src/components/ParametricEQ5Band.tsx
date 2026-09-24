@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useRef, useEffect } from 'react';
 import * as d3 from 'd3';
-import { Sliders, Activity, Power, RotateCcw, Volume2, ShieldCheck } from 'lucide-react';
+import { Sliders, Activity, Power, RotateCcw, Volume2, ShieldCheck, Zap, AlertTriangle } from 'lucide-react';
 
 export interface ParametricBand5 {
   id: string;
@@ -61,6 +61,24 @@ export const ParametricEQ5Band: React.FC<ParametricEQ5BandProps> = ({ onBandsCha
   const handleReset = () => {
     setBands(DEFAULT_5BAND_CONFIG);
     if (onBandsChanged) onBandsChanged(DEFAULT_5BAND_CONFIG);
+  };
+
+  // Auto-Trim calculation for 5-band Parametric EQ
+  const maxParametricBoost = useMemo(() => {
+    const boostableBands = bands.filter((b) => b.enabled && b.type !== 'highpass' && b.type !== 'lowpass');
+    if (boostableBands.length === 0) return 0;
+    return Math.max(0, ...boostableBands.map((b) => b.gain));
+  }, [bands]);
+
+  const autoTrimSuggestedGain = useMemo(() => {
+    return Math.round(-maxParametricBoost * 2) / 2;
+  }, [maxParametricBoost]);
+
+  const estimatedPeakDbFS = masterGain + maxParametricBoost;
+  const isClippingRisk = estimatedPeakDbFS > 0.05;
+
+  const handleApplyAutoTrim = () => {
+    setMasterGain(autoTrimSuggestedGain);
   };
 
   const selectedBand = bands.find((b) => b.id === selectedBandId) || bands[2];
@@ -175,6 +193,41 @@ export const ParametricEQ5Band: React.FC<ParametricEQ5BandProps> = ({ onBandsCha
         </div>
 
         <div className="flex items-center gap-2">
+          {/* Peak Ceiling Indicator */}
+          <div
+            className={`text-xs font-bold px-2.5 py-1.5 rounded-xl flex items-center gap-1 border ${
+              isClippingRisk
+                ? 'bg-red-950/80 text-red-300 border-red-800/80 animate-pulse'
+                : 'bg-emerald-950/60 text-emerald-300 border-emerald-800/60'
+            }`}
+            title={`Max Parametric Boost: +${maxParametricBoost.toFixed(1)}dB | Master Gain: ${masterGain.toFixed(1)}dB`}
+          >
+            {isClippingRisk ? (
+              <>
+                <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0" />
+                <span>Peak +{estimatedPeakDbFS.toFixed(1)}dB</span>
+              </>
+            ) : (
+              <>
+                <ShieldCheck className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                <span>Peak {estimatedPeakDbFS.toFixed(1)}dB</span>
+              </>
+            )}
+          </div>
+
+          <button
+            onClick={handleApplyAutoTrim}
+            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold rounded-xl transition-all cursor-pointer shadow-md ${
+              isClippingRisk
+                ? 'bg-amber-600 hover:bg-amber-500 text-white shadow-amber-600/30 animate-pulse'
+                : 'bg-slate-800 hover:bg-slate-700 text-amber-300 border border-slate-700'
+            }`}
+            title="Auto-Trim Master Output Gain to enforce 0dB digital ceiling"
+          >
+            <Zap className="w-3.5 h-3.5 text-yellow-300 fill-current" />
+            <span>Auto-Trim ({autoTrimSuggestedGain > 0 ? `+${autoTrimSuggestedGain}` : autoTrimSuggestedGain}dB)</span>
+          </button>
+
           <button
             onClick={handleReset}
             className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold rounded-xl border border-slate-700 transition-all cursor-pointer"

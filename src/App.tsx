@@ -1,10 +1,10 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { 
     Play, Mic, RefreshCw, Sliders, CheckCircle2, 
     AlertCircle, Volume2, Activity, ShieldCheck, 
     BarChart3, Layers, Radio, Save, HardDrive,
     Download, Upload, Compass, Cpu, RotateCcw, Keyboard,
-    Power, PowerOff
+    Power, PowerOff, Zap, AlertTriangle
 } from 'lucide-react';
 import { EQCurveOverlay } from './components/EQCurveOverlay';
 import { PresetsLibrary } from './components/PresetsLibrary';
@@ -13,6 +13,11 @@ import { AudioTranscriber } from './components/AudioTranscriber';
 import { LiveVoiceAssistant } from './components/LiveVoiceAssistant';
 import { AcousticSearchGrounding } from './components/AcousticSearchGrounding';
 import { ParametricEQ5Band } from './components/ParametricEQ5Band';
+import { CalibrationExporter } from './components/CalibrationExporter';
+import { MultiSweepAverager } from './components/MultiSweepAverager';
+import { RoomAcoustics3D } from './components/RoomAcoustics3D';
+import { RT60Analyzer } from './components/RT60Analyzer';
+import { PDFReportGenerator } from './components/PDFReportGenerator';
 import { saveProfileToFirestore, getProfilesFromFirestore, SavedCalibrationDoc } from './lib/firebase';
 
 export class AcousticSweepGenerator {
@@ -423,6 +428,40 @@ export default function App() {
   const [activeEqMatrix, setActiveEqMatrix] = useState<EQBandConfiguration[]>(DEFAULT_EQ_BANDS);
   const [masterGainDb, setMasterGainDb] = useState<number>(0);
   const [isBypassed, setIsBypassed] = useState<boolean>(false);
+  const [isAutoTrimLocked, setIsAutoTrimLocked] = useState<boolean>(false);
+
+  // Maximum positive boost in active EQ matrix
+  const maxEqBoost = useMemo(() => {
+    if (!activeEqMatrix || activeEqMatrix.length === 0) return 0;
+    return Math.max(0, ...activeEqMatrix.map((b) => b.gain));
+  }, [activeEqMatrix]);
+
+  // Optimal Master Output Gain to prevent digital clipping (0 dB digital ceiling)
+  const autoTrimSuggestedGain = useMemo(() => {
+    return Math.round(-maxEqBoost * 2) / 2;
+  }, [maxEqBoost]);
+
+  // Estimated peak output level relative to full scale input
+  const estimatedPeakDbFS = useMemo(() => {
+    return masterGainDb + maxEqBoost;
+  }, [masterGainDb, maxEqBoost]);
+
+  const isClippingRisk = estimatedPeakDbFS > 0.05;
+
+  const handleAutoTrim = () => {
+    const trimGain = autoTrimSuggestedGain;
+    setMasterGainDb(trimGain);
+    if (threadControllerRef.current) {
+      threadControllerRef.current.updateMasterGain(trimGain);
+    }
+    if (maxEqBoost === 0) {
+      setSaveSuccessMessage('Auto-Trim Applied: All EQ gains are 0.0 dB or negative. Master Output Gain set to 0.0 dB (Unity).');
+    } else {
+      setSaveSuccessMessage(
+        `Auto-Trim Applied! Max EQ boost was +${maxEqBoost.toFixed(1)} dB. Master Output Gain adjusted to ${trimGain.toFixed(1)} dB to ensure peak output stays within 0 dB digital ceiling and prevent clipping.`
+      );
+    }
+  };
 
   const handleMasterGainChange = (newGainDb: number) => {
     setMasterGainDb(newGainDb);
@@ -450,7 +489,9 @@ export default function App() {
   const [liveMetrics, setLiveMetrics] = useState<{ peakDb: string; activeFreq: string }>({ peakDb: '-inf dB', activeFreq: '0 Hz' });
   const [visualizerMode, setVisualizerMode] = useState<'frequency' | 'spectrogram'>('frequency');
   const [smoothingConstant, setSmoothingConstant] = useState<number>(0.85);
-  const [activeFeatureTab, setActiveFeatureTab] = useState<'calibration' | 'parametric' | 'transcribe' | 'live' | 'search'>('calibration');
+  const [activeFeatureTab, setActiveFeatureTab] = useState<
+    'calibration' | 'parametric' | 'multisweep' | 'room3d' | 'rt60' | 'exports' | 'pdfreport' | 'transcribe' | 'live' | 'search'
+  >('calibration');
 
   const [isPlayingPinkNoise, setIsPlayingPinkNoise] = useState<boolean>(false);
   const pinkNoiseHandleRef = useRef<{ stop: () => void } | null>(null);
@@ -518,9 +559,20 @@ export default function App() {
     );
     setActiveEqMatrix(updatedMatrix);
 
+    let effectiveMasterGain = masterGainDb;
+    if (isAutoTrimLocked) {
+      const currentMaxBoost = Math.max(0, ...updatedMatrix.map((b) => b.gain));
+      const autoTrimGain = Math.round(-currentMaxBoost * 2) / 2;
+      setMasterGainDb(autoTrimGain);
+      effectiveMasterGain = autoTrimGain;
+      if (threadControllerRef.current) {
+        threadControllerRef.current.updateMasterGain(autoTrimGain);
+      }
+    }
+
     // Push new curve to AudioWorklet thread
     if (threadControllerRef.current) {
-      threadControllerRef.current.pushNewCalibrationProfile(updatedMatrix);
+      threadControllerRef.current.pushNewCalibrationProfile(updatedMatrix, effectiveMasterGain, isBypassed);
     }
 
     // Keep calibrationResult in sync if present
@@ -559,6 +611,13 @@ export default function App() {
         return;
       }
 
+      // T / t -> Trigger Auto-Trim Output Gain
+      if (e.key.toLowerCase() === 't' && !e.metaKey && !e.altKey) {
+        e.preventDefault();
+        handleAutoTrim();
+        return;
+      }
+
       // Spacebar -> Start / Stop Room Acoustic Sweep
       if (e.code === 'Space') {
         e.preventDefault();
@@ -593,7 +652,7 @@ export default function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isCalibrating, visualizerMode, activeEqMatrix, isBypassed]);
+  }, [isCalibrating, visualizerMode, activeEqMatrix, isBypassed, isAutoTrimLocked, autoTrimSuggestedGain]);
 
   // Reset EQ matrix back to flat 0 dB
   const handleResetFlat = () => {
@@ -938,7 +997,7 @@ export default function App() {
         <div className="max-w-7xl mx-auto flex flex-wrap items-center gap-2">
           <button
             onClick={() => setActiveFeatureTab('calibration')}
-            className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
               activeFeatureTab === 'calibration'
                 ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20'
                 : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 border border-slate-800'
@@ -950,53 +1009,116 @@ export default function App() {
 
           <button
             onClick={() => setActiveFeatureTab('parametric')}
-            className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
               activeFeatureTab === 'parametric'
                 ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/20'
                 : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 border border-slate-800'
             }`}
           >
             <Activity className="w-3.5 h-3.5" />
-            <span>5-Band Parametric EQ</span>
+            <span>5-Band Parametric</span>
+          </button>
+
+          <button
+            onClick={() => setActiveFeatureTab('exports')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+              activeFeatureTab === 'exports'
+                ? 'bg-cyan-600 text-white shadow-lg shadow-cyan-600/20'
+                : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 border border-slate-800'
+            }`}
+          >
+            <Download className="w-3.5 h-3.5" />
+            <span>Hardware & DAW Exporters</span>
+            <span className="text-[9px] px-1.5 py-0.2 rounded bg-cyan-500/20 text-cyan-300 font-mono">APO / MiniDSP / WAV IR</span>
+          </button>
+
+          <button
+            onClick={() => setActiveFeatureTab('room3d')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+              activeFeatureTab === 'room3d'
+                ? 'bg-cyan-600 text-white shadow-lg shadow-cyan-600/20'
+                : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 border border-slate-800'
+            }`}
+          >
+            <Compass className="w-3.5 h-3.5" />
+            <span>3D Room Acoustics</span>
+            <span className="text-[9px] px-1.5 py-0.2 rounded bg-cyan-500/20 text-cyan-300 font-mono">3D WebGL</span>
+          </button>
+
+          <button
+            onClick={() => setActiveFeatureTab('multisweep')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+              activeFeatureTab === 'multisweep'
+                ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/20'
+                : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 border border-slate-800'
+            }`}
+          >
+            <Layers className="w-3.5 h-3.5" />
+            <span>Multi-Point Sweeps</span>
+            <span className="text-[9px] px-1.5 py-0.2 rounded bg-indigo-500/20 text-indigo-300 font-mono">3-9 Position Avg</span>
+          </button>
+
+          <button
+            onClick={() => setActiveFeatureTab('rt60')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+              activeFeatureTab === 'rt60'
+                ? 'bg-purple-600 text-white shadow-lg shadow-purple-600/20'
+                : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 border border-slate-800'
+            }`}
+          >
+            <BarChart3 className="w-3.5 h-3.5" />
+            <span>RT60 Decay</span>
+          </button>
+
+          <button
+            onClick={() => setActiveFeatureTab('pdfreport')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+              activeFeatureTab === 'pdfreport'
+                ? 'bg-amber-600 text-white shadow-lg shadow-amber-600/20'
+                : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 border border-slate-800'
+            }`}
+          >
+            <Upload className="w-3.5 h-3.5" />
+            <span>PDF Audit Report</span>
+            <span className="text-[9px] px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 font-mono">White-Label</span>
           </button>
 
           <button
             onClick={() => setActiveFeatureTab('transcribe')}
-            className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
               activeFeatureTab === 'transcribe'
                 ? 'bg-purple-600 text-white shadow-lg shadow-purple-600/20'
                 : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 border border-slate-800'
             }`}
           >
             <Mic className="w-3.5 h-3.5" />
-            <span>Audio Note Transcriber</span>
+            <span>Transcriber</span>
             <span className="text-[9px] px-1.5 py-0.2 rounded bg-purple-500/20 text-purple-300 font-mono">3.5</span>
           </button>
 
           <button
             onClick={() => setActiveFeatureTab('live')}
-            className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
               activeFeatureTab === 'live'
                 ? 'bg-emerald-600 text-white shadow-lg shadow-emerald-600/20'
                 : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 border border-slate-800'
             }`}
           >
             <Radio className="w-3.5 h-3.5" />
-            <span>Talk with Acoustic AI</span>
+            <span>AI Voice Call</span>
             <span className="text-[9px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 font-mono">3.8 Live</span>
           </button>
 
           <button
             onClick={() => setActiveFeatureTab('search')}
-            className={`px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-2 ${
               activeFeatureTab === 'search'
                 ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/20'
                 : 'bg-slate-900/80 hover:bg-slate-800 text-slate-400 border border-slate-800'
             }`}
           >
             <BarChart3 className="w-3.5 h-3.5" />
-            <span>Acoustic Search Grounding</span>
-            <span className="text-[9px] px-1.5 py-0.2 rounded bg-indigo-500/20 text-indigo-300 font-mono">3.8 Flash</span>
+            <span>Acoustic Search</span>
           </button>
         </div>
       </div>
@@ -1280,6 +1402,19 @@ export default function App() {
 
               <div className="flex items-center space-x-2">
                 <button
+                  onClick={handleAutoTrim}
+                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold rounded-lg transition-all cursor-pointer shadow-md ${
+                    isClippingRisk
+                      ? 'bg-amber-600 hover:bg-amber-500 text-white shadow-amber-600/30 animate-pulse border border-amber-400'
+                      : 'bg-slate-800 hover:bg-slate-700 text-amber-300 border border-slate-700'
+                  }`}
+                  title="Auto-Trim: Analyze current EQ matrix boost and adjust Master Output Gain to keep peak <= 0 dBFS (T)"
+                >
+                  <Zap className="w-3.5 h-3.5 text-yellow-300 fill-current" />
+                  <span>Auto-Trim ({autoTrimSuggestedGain > 0 ? `+${autoTrimSuggestedGain}` : autoTrimSuggestedGain}dB)</span>
+                  <kbd className="text-[9px] bg-slate-900 border border-slate-700 px-1 rounded text-slate-400">T</kbd>
+                </button>
+                <button
                   onClick={handleToggleBypass}
                   className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold rounded-lg border transition-all cursor-pointer ${
                     isBypassed
@@ -1419,16 +1554,40 @@ export default function App() {
                   ))}
                 </div>
 
-                {/* Master Output Gain Fader & Bypass Column */}
-                <div className={`bg-gradient-to-b from-slate-900 to-slate-950 border-2 rounded-xl p-2.5 flex flex-col items-center justify-between space-y-2 lg:w-28 shrink-0 shadow-lg transition-all ${
-                  isBypassed ? 'border-amber-500/80 shadow-amber-500/15' : 'border-indigo-500/40 shadow-indigo-500/10'
+                {/* Master Output Gain Fader & Auto-Trim Column */}
+                <div className={`bg-gradient-to-b from-slate-900 to-slate-950 border-2 rounded-xl p-2 flex flex-col items-center justify-between space-y-1.5 lg:w-32 shrink-0 shadow-lg transition-all ${
+                  isClippingRisk
+                    ? 'border-amber-500/80 shadow-amber-500/20'
+                    : isBypassed ? 'border-amber-500/80' : 'border-indigo-500/40 shadow-indigo-500/10'
                 }`}>
                   <div className="flex items-center gap-1 text-[10px] font-bold text-indigo-400 uppercase tracking-wider">
                     <Volume2 className="w-3.5 h-3.5 text-indigo-400" /> Master
                   </div>
 
+                  {/* Peak Digital Output Ceiling Indicator */}
+                  <div
+                    className={`w-full text-[9px] font-bold rounded-lg py-1 px-1 text-center flex items-center justify-center gap-0.5 border ${
+                      isClippingRisk
+                        ? 'bg-red-950/80 text-red-300 border-red-800/90 animate-pulse'
+                        : 'bg-emerald-950/60 text-emerald-300 border-emerald-800/60'
+                    }`}
+                    title={`Max EQ Boost: +${maxEqBoost.toFixed(1)}dB | Master Gain: ${masterGainDb.toFixed(1)}dB | Peak Output: ${estimatedPeakDbFS.toFixed(1)}dBFS`}
+                  >
+                    {isClippingRisk ? (
+                      <>
+                        <AlertTriangle className="w-3 h-3 text-red-400 shrink-0" />
+                        <span>Peak +{estimatedPeakDbFS.toFixed(1)}dB</span>
+                      </>
+                    ) : (
+                      <>
+                        <ShieldCheck className="w-3 h-3 text-emerald-400 shrink-0" />
+                        <span>Peak {estimatedPeakDbFS.toFixed(1)}dB</span>
+                      </>
+                    )}
+                  </div>
+
                   {/* Vertical Master Slider Control */}
-                  <div className="h-28 flex items-center justify-center py-1 relative">
+                  <div className="h-24 flex items-center justify-center py-1 relative">
                     <input
                       type="range"
                       min="-24"
@@ -1436,7 +1595,7 @@ export default function App() {
                       step="0.5"
                       value={masterGainDb}
                       onChange={(e) => handleMasterGainChange(parseFloat(e.target.value))}
-                      className="h-24 w-2.5 accent-indigo-500 bg-slate-800 rounded-lg cursor-pointer [writing-mode:vertical-lr] [direction:rtl]"
+                      className="h-20 w-2.5 accent-indigo-500 bg-slate-800 rounded-lg cursor-pointer [writing-mode:vertical-lr] [direction:rtl]"
                     />
                   </div>
 
@@ -1445,7 +1604,26 @@ export default function App() {
                       {masterGainDb > 0 ? `+${masterGainDb}` : `${masterGainDb}`} <span className="text-[9px] font-normal text-slate-400">dB</span>
                     </div>
 
-                    <div className="flex flex-col gap-1 pt-1">
+                    <div className="flex flex-col gap-1 pt-0.5">
+                      <button
+                        onClick={handleAutoTrim}
+                        className="w-full py-1.5 px-1 rounded-lg text-[9px] font-extrabold bg-gradient-to-r from-amber-600 to-orange-600 hover:from-amber-500 hover:to-orange-500 text-white flex items-center justify-center gap-1 transition-all cursor-pointer shadow-md shadow-amber-600/20 border border-amber-400/40"
+                        title="Auto-Trim Master Output Gain to enforce 0dB digital ceiling (T)"
+                      >
+                        <Zap className="w-3 h-3 text-yellow-200 fill-current shrink-0" />
+                        <span>Auto-Trim</span>
+                      </button>
+
+                      <label className="flex items-center justify-center gap-1 text-[8px] text-slate-400 cursor-pointer pt-0.5 select-none" title="Automatically keep Master Output Gain trimmed whenever EQ sliders are moved">
+                        <input
+                          type="checkbox"
+                          checked={isAutoTrimLocked}
+                          onChange={(e) => setIsAutoTrimLocked(e.target.checked)}
+                          className="rounded accent-indigo-500 cursor-pointer w-3 h-3"
+                        />
+                        <span>Auto-Lock 0dB</span>
+                      </label>
+
                       <button
                         onClick={handleToggleBypass}
                         className={`w-full py-1 px-1 rounded-lg text-[9px] font-bold flex items-center justify-center gap-1 transition-all cursor-pointer border ${
@@ -1496,6 +1674,35 @@ export default function App() {
       <div className="max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 pb-12 space-y-6">
         {activeFeatureTab === 'parametric' && <ParametricEQ5Band />}
 
+        {activeFeatureTab === 'exports' && (
+          <CalibrationExporter
+            eqMatrix={activeEqMatrix}
+            profileName={targetProfile}
+            targetDevice={deviceType}
+          />
+        )}
+
+        {activeFeatureTab === 'room3d' && <RoomAcoustics3D />}
+
+        {activeFeatureTab === 'multisweep' && (
+          <MultiSweepAverager
+            onAverageCalculated={(avg) => {
+              const updated = activeEqMatrix.map((item) => {
+                const match = avg.find((f) => f.freq === item.freq);
+                return match ? { ...item, gain: match.db } : item;
+              });
+              setActiveEqMatrix(updated);
+              setSaveSuccessMessage('Spatial 3-9 point averaged EQ applied to active calibration suite.');
+            }}
+          />
+        )}
+
+        {activeFeatureTab === 'rt60' && <RT60Analyzer />}
+
+        {activeFeatureTab === 'pdfreport' && (
+          <PDFReportGenerator eqMatrix={activeEqMatrix} />
+        )}
+
         {activeFeatureTab === 'transcribe' && (
           <AudioTranscriber
             onTranscriptReceived={(text) => {
@@ -1533,6 +1740,16 @@ export default function App() {
                 </div>
                 <kbd className="px-2.5 py-1 bg-slate-900 border border-slate-700 rounded-lg text-xs font-mono text-blue-300 font-bold shadow">
                   Space
+                </kbd>
+              </div>
+
+              <div className="flex items-center justify-between p-3 rounded-xl bg-slate-950 border border-slate-800/80">
+                <div>
+                  <div className="font-semibold text-xs text-white">Auto-Trim Output Gain (0dB Ceiling)</div>
+                  <div className="text-[10px] text-slate-400">Analyzes peak boost and trims Master Output Gain to prevent clipping</div>
+                </div>
+                <kbd className="px-2.5 py-1 bg-slate-900 border border-slate-700 rounded-lg text-xs font-mono text-yellow-300 font-bold shadow">
+                  T
                 </kbd>
               </div>
 
